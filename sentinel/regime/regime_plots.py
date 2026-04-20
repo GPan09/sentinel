@@ -39,12 +39,14 @@ CHART_STYLE = {
 REGIME_COLOR_2 = ["#d62728", "#2ca02c"]
 REGIME_COLOR_3 = ["#d62728", "#ff7f0e", "#2ca02c"]
 REGIME_COLOR_4 = ["#7c1c1c", "#d62728", "#ff7f0e", "#2ca02c"]
+REGIME_COLOR_5 = ["#7c1c1c", "#d62728", "#e67c2e", "#ff7f0e", "#2ca02c"]
 
 
 def _regime_colors(k: int):
-    return {2: REGIME_COLOR_2, 3: REGIME_COLOR_3, 4: REGIME_COLOR_4}.get(
-        k, SENTINEL_PALETTE[:k]
-    )
+    return {
+        2: REGIME_COLOR_2, 3: REGIME_COLOR_3,
+        4: REGIME_COLOR_4, 5: REGIME_COLOR_5,
+    }.get(k, SENTINEL_PALETTE[:k])
 
 
 def _style(ax):
@@ -610,4 +612,394 @@ def plot_feature_boxplots_by_state(
         fig.tight_layout()
         if save_path:
             fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        return fig
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 4 Deliverable 3 — Regime-aware strategy + nowcast (Charts 45–48)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _regime_spans(viterbi_labeled: pd.Series, labels):
+    """Yield (start_date, end_date, label) tuples of contiguous regime episodes."""
+    lab_idx = viterbi_labeled.astype(int)
+    changes = lab_idx.ne(lab_idx.shift()).cumsum()
+    for _, grp in lab_idx.groupby(changes):
+        yield grp.index[0], grp.index[-1], labels[int(grp.iloc[0])]
+
+
+# ── Chart 45 — Regime-gated equity curve vs buy-and-hold ──────────────────────
+
+def plot_regime_gated_equity(
+    equity_strat: pd.Series,
+    equity_bh: pd.Series,
+    signal: pd.Series,
+    viterbi_labeled: pd.Series,
+    labels,
+    metrics_strat: dict,
+    metrics_bh: dict,
+    ticker: str = "SPY",
+    save_path: Optional[str] = None,
+):
+    """
+    Chart 45 — Regime-gated strategy vs buy-and-hold.
+
+    Top panel: two equity curves (log scale) with regime shading behind them.
+                The strategy is flat during shaded Bear periods (in cash)
+                and tracks the benchmark during bullish periods.
+    Middle:    the 0/1 signal over time (when invested vs cash).
+    Bottom:    strategy drawdown.
+
+    Metric boxes in the corner show CAGR / Sharpe / max DD for both.
+    """
+    colors = _regime_colors(len(labels))
+
+    with plt.rc_context(CHART_STYLE):
+        fig, (ax1, ax2, ax3) = plt.subplots(
+            3, 1, figsize=(13, 9), sharex=True,
+            gridspec_kw={"height_ratios": [3, 0.9, 1.4]},
+        )
+
+        # Top — regime shading + two equity curves
+        for s, e, lab in _regime_spans(viterbi_labeled, labels):
+            ax1.axvspan(s, e, color=colors[labels.index(lab)], alpha=0.15, lw=0)
+
+        ax1.plot(equity_bh.index, equity_bh.values,
+                 color="#8b949e", lw=1.3, label=f"{ticker} buy-and-hold")
+        ax1.plot(equity_strat.index, equity_strat.values,
+                 color=SENTINEL_PALETTE[2], lw=1.6, label="Regime-gated strategy")
+        ax1.set_yscale("log")
+        ax1.set_ylabel("Equity ($, log)")
+        ax1.set_title(f"Chart 45 — Regime-Gated Strategy vs Buy-and-Hold  ({ticker})")
+        ax1.legend(loc="upper left", framealpha=0.85)
+        _style(ax1)
+
+        # Metric-box overlay (top-right of ax1)
+        lines = [
+            f"Strategy   CAGR {metrics_strat.get('cagr', 0)*100:+5.1f}%  "
+            f"Sharpe {metrics_strat.get('sharpe', 0):+.2f}  "
+            f"MDD {metrics_strat.get('max_drawdown', 0)*100:+5.1f}%",
+            f"Buy-hold   CAGR {metrics_bh.get('cagr', 0)*100:+5.1f}%  "
+            f"Sharpe {metrics_bh.get('sharpe', 0):+.2f}  "
+            f"MDD {metrics_bh.get('max_drawdown', 0)*100:+5.1f}%",
+        ]
+        ax1.text(0.985, 0.04, "\n".join(lines),
+                 transform=ax1.transAxes, ha="right", va="bottom",
+                 family="monospace", fontsize=9,
+                 bbox=dict(boxstyle="round", facecolor="#0d1117",
+                           edgecolor="#30363d", alpha=0.9))
+
+        # Middle — signal (step plot)
+        ax2.fill_between(signal.index, 0, signal.values,
+                         step="pre", color=SENTINEL_PALETTE[2], alpha=0.55,
+                         linewidth=0)
+        ax2.set_ylim(-0.05, 1.05)
+        ax2.set_yticks([0, 1])
+        ax2.set_yticklabels(["Cash", "Invested"])
+        ax2.set_ylabel("Position")
+        _style(ax2)
+
+        # Bottom — drawdown
+        peak = equity_strat.cummax()
+        drawdown = (equity_strat - peak) / peak * 100.0
+        ax3.fill_between(drawdown.index, drawdown.values, 0,
+                         color=SENTINEL_PALETTE[3], alpha=0.55, linewidth=0)
+        ax3.set_ylabel("Drawdown (%)")
+        ax3.set_xlabel("Date")
+        _style(ax3)
+
+        fig.tight_layout()
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        return fig
+
+
+# ── Chart 46 — Rolling 1-year alpha vs buy-and-hold ──────────────────────────
+
+def plot_rolling_alpha(
+    rolling_alpha: pd.Series,
+    viterbi_labeled: pd.Series,
+    labels,
+    window_days: int = 252,
+    save_path: Optional[str] = None,
+):
+    """
+    Chart 46 — Rolling annualised alpha of the regime-gated strategy.
+
+    The alpha series α_t should be ~0 during Bull/Sideways regimes (strategy
+    tracks buy-hold) and spike positive during Bear regimes (strategy in cash
+    avoids the drawdown). The chart overlays regime shading so the reader can
+    see the mechanism: alpha bumps coincide with red Bear bands.
+    """
+    colors = _regime_colors(len(labels))
+
+    with plt.rc_context(CHART_STYLE):
+        fig, ax = plt.subplots(figsize=(13, 5))
+
+        # Regime shading
+        viterbi_aligned = viterbi_labeled.reindex(rolling_alpha.index).ffill()
+        for s, e, lab in _regime_spans(viterbi_aligned.dropna(), labels):
+            ax.axvspan(s, e, color=colors[labels.index(lab)], alpha=0.15, lw=0)
+
+        alpha_pct = rolling_alpha * 100.0
+        ax.fill_between(alpha_pct.index, 0, alpha_pct.values,
+                        where=(alpha_pct.values > 0),
+                        color=SENTINEL_PALETTE[2], alpha=0.55,
+                        interpolate=True, label="Strategy > B&H")
+        ax.fill_between(alpha_pct.index, 0, alpha_pct.values,
+                        where=(alpha_pct.values < 0),
+                        color=SENTINEL_PALETTE[3], alpha=0.55,
+                        interpolate=True, label="Strategy < B&H")
+        ax.plot(alpha_pct.index, alpha_pct.values,
+                color="#c9d1d9", lw=1.0)
+        ax.axhline(0, color="#30363d", lw=0.8)
+
+        ax.set_ylabel("Rolling annualised alpha (%)")
+        ax.set_xlabel("Date")
+        ax.set_title(f"Chart 46 — Rolling {window_days}-day Alpha vs Buy-and-Hold")
+        ax.legend(loc="upper left", framealpha=0.85)
+        _style(ax)
+
+        fig.tight_layout()
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        return fig
+
+
+# ── Chart 47 — Regime-transition early warning + recent posterior ────────────
+
+def plot_regime_transitions_nowcast(
+    posteriors: pd.DataFrame,
+    change_score: pd.Series,
+    transitions: pd.DataFrame,
+    recent_window: int = 90,
+    save_path: Optional[str] = None,
+):
+    """
+    Chart 47 — two panels.
+
+    Top:    the L1 regime-change score over the full history, with vertical
+            markers at detected transition days (from → to).
+    Bottom: zoomed view of the posterior trajectory over the last
+            `recent_window` days — what's the regime distribution doing RIGHT NOW.
+    """
+    labels = list(posteriors.columns)
+    colors = _regime_colors(len(labels))
+
+    with plt.rc_context(CHART_STYLE):
+        fig, (ax1, ax2) = plt.subplots(
+            2, 1, figsize=(13, 8),
+            gridspec_kw={"height_ratios": [1, 1.3]},
+        )
+
+        # Top — change score with transition markers
+        ax1.fill_between(change_score.index, 0, change_score.values,
+                         color=SENTINEL_PALETTE[1], alpha=0.55, linewidth=0)
+        ax1.plot(change_score.index, change_score.values,
+                 color=SENTINEL_PALETTE[1], lw=0.9)
+        ymax = float(change_score.max()) if len(change_score) else 1.0
+        for _, row in transitions.iterrows():
+            ax1.axvline(row["date"], color=SENTINEL_PALETTE[3],
+                        lw=0.8, ls="--", alpha=0.7)
+        ax1.set_ylabel("Regime-change score")
+        ax1.set_title("Chart 47 — Regime Transition Early-Warning & Current Posterior")
+        ax1.set_ylim(0, max(1.0, ymax * 1.1))
+        _style(ax1)
+
+        # Transitions table overlay (top-right)
+        if len(transitions):
+            tail = transitions.tail(5)
+            lines = [f"{d.strftime('%Y-%m-%d')}  {f}→{t}  ({s:.2f})"
+                     for d, f, t, s in zip(
+                         tail["date"], tail["from"], tail["to"], tail["score"])]
+            ax1.text(0.985, 0.96, "Recent transitions:\n" + "\n".join(lines),
+                     transform=ax1.transAxes, ha="right", va="top",
+                     family="monospace", fontsize=8,
+                     bbox=dict(boxstyle="round", facecolor="#0d1117",
+                               edgecolor="#30363d", alpha=0.9))
+
+        # Bottom — zoomed stacked posterior over last N days
+        recent = posteriors.iloc[-recent_window:] if len(posteriors) >= recent_window \
+                 else posteriors
+        ax2.stackplot(recent.index, recent.T.values,
+                      labels=labels, colors=colors, alpha=0.9, linewidth=0)
+        ax2.set_ylim(0, 1)
+        ax2.set_ylabel(f"Posterior probability (last {len(recent)} days)")
+        ax2.set_xlabel("Date")
+        ax2.legend(loc="lower left", ncol=len(labels), framealpha=0.85)
+        _style(ax2)
+
+        fig.tight_layout()
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        return fig
+
+
+# ── Chart 48 — Master nowcast dashboard ──────────────────────────────────────
+
+def plot_nowcast_dashboard(
+    nowcast: dict,
+    posteriors: pd.DataFrame,
+    equity_strat: pd.Series,
+    equity_bh: pd.Series,
+    summary: dict,
+    ticker: str = "SPY",
+    save_path: Optional[str] = None,
+):
+    """
+    Chart 48 — the "put this in your LinkedIn post" master dashboard.
+
+    Single exportable figure with 6 panels:
+      (A) Current regime + posterior bar chart + expected duration
+      (B) Stationary distribution donut
+      (C) Last 60 days posterior stacked timeline
+      (D) Strategy vs buy-hold equity curve (small)
+      (E) Metrics table (CAGR / Sharpe / MDD for both)
+      (F) State characteristics mini-table (from summary['characteristics'])
+    """
+    labels = list(posteriors.columns)
+    colors = _regime_colors(len(labels))
+
+    with plt.rc_context(CHART_STYLE):
+        fig = plt.figure(figsize=(15, 9))
+        gs = fig.add_gridspec(3, 3, hspace=0.55, wspace=0.35,
+                              height_ratios=[1, 1, 1])
+
+        # ── (A) Current posterior bar chart ──────────────────────────────────
+        axA = fig.add_subplot(gs[0, 0])
+        post = nowcast["current_posterior"]
+        xs = list(post.keys())
+        ys = [post[k] for k in xs]
+        bar_colors = [colors[labels.index(k)] for k in xs]
+        bars = axA.bar(xs, ys, color=bar_colors, alpha=0.85,
+                       edgecolor="#0d1117", lw=1.5)
+        for b, v in zip(bars, ys):
+            axA.text(b.get_x() + b.get_width()/2, v + 0.02,
+                     f"{v*100:.0f}%", ha="center", va="bottom",
+                     color="#c9d1d9", fontsize=9)
+        axA.set_ylim(0, 1.15)
+        axA.set_ylabel("Posterior")
+        axA.set_title(f"Current regime: {nowcast['current_state']}\n"
+                      f"as of {nowcast['as_of']}")
+        axA.tick_params(axis="x", rotation=0)
+        _style(axA)
+
+        # ── (B) Stationary distribution donut ────────────────────────────────
+        axB = fig.add_subplot(gs[0, 1])
+        stat = nowcast["stationary_dist"]
+        stat_vals = [stat.get(lab, 0) for lab in labels]
+        axB.pie(stat_vals, labels=labels, colors=colors,
+                autopct="%1.0f%%", pctdistance=0.75,
+                textprops={"color": "#c9d1d9", "fontsize": 9},
+                wedgeprops={"edgecolor": "#0d1117", "linewidth": 2,
+                            "width": 0.40})
+        axB.set_title("Long-run stationary distribution")
+
+        # ── (C) Recent posterior timeline ────────────────────────────────────
+        axC = fig.add_subplot(gs[0, 2])
+        recent = posteriors.iloc[-60:] if len(posteriors) >= 60 else posteriors
+        axC.stackplot(recent.index, recent.T.values,
+                      colors=colors, alpha=0.9, linewidth=0)
+        axC.set_ylim(0, 1)
+        axC.set_ylabel("Posterior")
+        axC.set_title("Last 60 days")
+        axC.tick_params(axis="x", rotation=30, labelsize=8)
+        _style(axC)
+
+        # ── (D) Strategy vs buy-hold equity curve ────────────────────────────
+        axD = fig.add_subplot(gs[1, :2])
+        axD.plot(equity_bh.index, equity_bh.values,
+                 color="#8b949e", lw=1.2, label=f"{ticker} B&H")
+        axD.plot(equity_strat.index, equity_strat.values,
+                 color=SENTINEL_PALETTE[2], lw=1.6, label="Regime-gated")
+        axD.set_yscale("log")
+        axD.set_ylabel("Equity ($, log)")
+        axD.legend(loc="upper left", framealpha=0.85)
+        axD.set_title("Equity curves (D2 canonical regime-gating)")
+        _style(axD)
+
+        # ── (E) Metrics table ────────────────────────────────────────────────
+        axE = fig.add_subplot(gs[1, 2])
+        axE.axis("off")
+        m_s = nowcast["strategy_metrics"]
+        m_b = nowcast["bh_metrics"]
+        table_data = [
+            ["", "Strategy", "Buy-Hold"],
+            ["CAGR",   f"{m_s.get('cagr', 0)*100:+.1f}%",
+                       f"{m_b.get('cagr', 0)*100:+.1f}%"],
+            ["Sharpe", f"{m_s.get('sharpe', 0):+.2f}",
+                       f"{m_b.get('sharpe', 0):+.2f}"],
+            ["Max DD", f"{m_s.get('max_drawdown', 0)*100:+.1f}%",
+                       f"{m_b.get('max_drawdown', 0)*100:+.1f}%"],
+        ]
+        tbl = axE.table(cellText=table_data, loc="center",
+                        cellLoc="center", colWidths=[0.35, 0.32, 0.32])
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(10)
+        tbl.scale(1, 1.5)
+        for (r, c), cell in tbl.get_celld().items():
+            cell.set_edgecolor("#30363d")
+            cell.set_facecolor("#161b22" if r == 0 else "#0d1117")
+            cell.get_text().set_color("#c9d1d9")
+            if r == 0 or c == 0:
+                cell.get_text().set_weight("bold")
+        axE.set_title("Performance metrics")
+
+        # ── (F) State characteristics table ──────────────────────────────────
+        axF = fig.add_subplot(gs[2, :])
+        axF.axis("off")
+        chars = summary["characteristics"]
+        display_cols = ["mean_daily_return", "annualized_return",
+                        "annualized_volatility", "sharpe_approx",
+                        "stationary_prob", "expected_duration_days"]
+        existing_cols = [c for c in display_cols if c in chars.columns]
+        disp = chars[existing_cols].copy()
+        # Format
+        if "mean_daily_return" in disp:
+            disp["mean_daily_return"] = disp["mean_daily_return"].apply(lambda v: f"{v*100:+.3f}%")
+        if "annualized_return" in disp:
+            disp["annualized_return"] = disp["annualized_return"].apply(lambda v: f"{v*100:+.1f}%")
+        if "annualized_volatility" in disp:
+            disp["annualized_volatility"] = disp["annualized_volatility"].apply(lambda v: f"{v*100:.1f}%")
+        if "sharpe_approx" in disp:
+            disp["sharpe_approx"] = disp["sharpe_approx"].apply(lambda v: f"{v:+.2f}")
+        if "stationary_prob" in disp:
+            disp["stationary_prob"] = disp["stationary_prob"].apply(lambda v: f"{v*100:.1f}%")
+        if "expected_duration_days" in disp:
+            disp["expected_duration_days"] = disp["expected_duration_days"].apply(lambda v: f"{v:.0f}")
+
+        rows = [["State"] + list(disp.columns)]
+        for state in disp.index:
+            rows.append([state] + list(disp.loc[state].values))
+        tbl2 = axF.table(cellText=rows, loc="center",
+                         cellLoc="center")
+        tbl2.auto_set_font_size(False)
+        tbl2.set_fontsize(9)
+        tbl2.scale(1, 1.4)
+        for (r, c), cell in tbl2.get_celld().items():
+            cell.set_edgecolor("#30363d")
+            if r == 0:
+                cell.set_facecolor("#161b22")
+                cell.get_text().set_weight("bold")
+            else:
+                cell.set_facecolor("#0d1117")
+                # Color the state-name cell with the regime palette
+                if c == 0:
+                    state_name = rows[r][0]
+                    if state_name in labels:
+                        cell.set_facecolor(colors[labels.index(state_name)])
+                        cell.set_alpha(0.35)
+            cell.get_text().set_color("#c9d1d9")
+        axF.set_title("State characteristics")
+
+        fig.suptitle(
+            f"Chart 48 — Sentinel Regime Nowcast  |  {ticker}  |  "
+            f"{nowcast['as_of']}  |  Position: "
+            f"{'INVESTED' if nowcast['invested'] else 'CASH'}",
+            fontsize=13, fontweight="bold",
+        )
+
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches="tight",
+                        facecolor=fig.get_facecolor())
         return fig
