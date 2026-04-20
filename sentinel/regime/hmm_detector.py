@@ -79,6 +79,7 @@ DEFAULT_LABELS: Dict[int, List[str]] = {
     2: ["Bear", "Bull"],
     3: ["Bear", "Sideways", "Bull"],
     4: ["Crash", "Bear", "Sideways", "Bull"],
+    5: ["Crash", "Severe Bear", "Bear", "Rally", "Calm"],
 }
 
 
