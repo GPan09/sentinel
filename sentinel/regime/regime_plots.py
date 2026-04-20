@@ -329,3 +329,285 @@ def plot_transition_matrix(
         if save_path:
             fig.savefig(save_path, dpi=150, bbox_inches="tight")
         return fig
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Phase 4 Deliverable 2 — Multivariate HMM + Model Selection (Charts 41–44)
+# ════════════════════════════════════════════════════════════════════════════
+
+# ── Chart 41 — BIC / AIC vs K ─────────────────────────────────────────────────
+
+def plot_k_selection(
+    comparison: pd.DataFrame,
+    chosen_k: int,
+    save_path: Optional[str] = None,
+) -> matplotlib.figure.Figure:
+    """
+    Chart 41 — Information criteria across candidate state counts K.
+
+    Lower BIC / AIC = better. BIC penalises complexity more heavily than AIC,
+    so BIC is usually what we honour when they disagree. The chosen K (here the
+    BIC minimum) is highlighted with a vertical dashed line.
+    """
+    with plt.rc_context(CHART_STYLE):
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5),
+                                       gridspec_kw={"width_ratios": [1.3, 1]})
+
+        xs = comparison.index.values
+
+        # left: BIC + AIC on shared y-axis
+        ax1.plot(xs, comparison["bic"], color=SENTINEL_PALETTE[0],
+                 marker="o", lw=1.8, label="BIC")
+        ax1.plot(xs, comparison["aic"], color=SENTINEL_PALETTE[1],
+                 marker="s", lw=1.8, label="AIC")
+        ax1.axvline(chosen_k, color=SENTINEL_PALETTE[3], lw=1.2, ls="--",
+                    label=f"Chosen K = {chosen_k}")
+        ax1.set_xticks(xs)
+        ax1.set_xlabel("Number of hidden states K")
+        ax1.set_ylabel("Information criterion  (lower = better)")
+        ax1.set_title("Chart 41 — Model Selection: BIC & AIC vs K")
+        _style(ax1)
+        ax1.legend(fontsize=9, loc="best")
+
+        bic_at_chosen = comparison.loc[chosen_k, "bic"]
+        ax1.annotate(f"BIC = {bic_at_chosen:.1f}",
+                     xy=(chosen_k, bic_at_chosen),
+                     xytext=(10, -25), textcoords="offset points",
+                     color="#c9d1d9", fontsize=9,
+                     arrowprops=dict(arrowstyle="->", color="#8b949e", lw=0.8))
+
+        ax2.bar(xs - 0.2, comparison["log_likelihood"], width=0.4,
+                color=SENTINEL_PALETTE[2], label="log L")
+        ax2.set_ylabel("log-likelihood", color=SENTINEL_PALETTE[2])
+        ax2.tick_params(axis="y", colors=SENTINEL_PALETTE[2])
+        ax2.set_xticks(xs)
+        ax2.set_xlabel("K")
+        _style(ax2)
+
+        ax2b = ax2.twinx()
+        ax2b.bar(xs + 0.2, comparison["n_params"], width=0.4,
+                 color="#c9d1d9", alpha=0.55, label="params")
+        ax2b.set_ylabel("# free parameters", color="#c9d1d9")
+        ax2b.spines[["top"]].set_visible(False)
+
+        ax2.set_title("Fit quality vs complexity")
+        h1, l1 = ax2.get_legend_handles_labels()
+        h2, l2 = ax2b.get_legend_handles_labels()
+        ax2.legend(h1 + h2, l1 + l2, fontsize=9, loc="upper left")
+
+        fig.tight_layout()
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        return fig
+
+
+# ── Chart 42 — Price + multivariate posteriors + features ─────────────────────
+
+def plot_mv_posteriors_with_features(
+    prices: pd.Series,
+    posteriors: pd.DataFrame,
+    features: pd.DataFrame,
+    ticker: str = "SPY",
+    save_path: Optional[str] = None,
+) -> matplotlib.figure.Figure:
+    """
+    Chart 42 — Three stacked panels on a shared date axis:
+      Top    : benchmark price (log) with Viterbi-implied regime shading
+               (derived here as the argmax of the posteriors per day)
+      Middle : stacked-area smoothed posteriors
+      Bottom : rolling realised vol and APC (the non-return features the HMM used)
+
+    This is the "show your work" panel — you can see exactly what information
+    the model had, and where its confidence shifts.
+    """
+    labels = list(posteriors.columns)
+    K = len(labels)
+    colors = _regime_colors(K)
+
+    v = posteriors.idxmax(axis=1).map({lab: i for i, lab in enumerate(labels)})
+    v = v.reindex(posteriors.index).ffill().astype(int)
+
+    p = prices.reindex(posteriors.index).dropna()
+    feat = features.reindex(posteriors.index).ffill()
+
+    vol_col = [c for c in feat.columns if c.startswith("vol_")]
+    apc_col = [c for c in feat.columns if c.startswith("apc_")]
+    vol_s = feat[vol_col[0]] if vol_col else None
+    apc_s = feat[apc_col[0]] if apc_col else None
+
+    change_pts = v.ne(v.shift()).cumsum()
+    segments = [(chunk.index[0], chunk.index[-1], int(chunk.iloc[0]))
+                for _, chunk in v.groupby(change_pts)]
+
+    with plt.rc_context(CHART_STYLE):
+        fig, axes = plt.subplots(
+            3, 1, figsize=(13, 10), sharex=True,
+            gridspec_kw={"height_ratios": [2.2, 1.4, 1.4]},
+        )
+        ax1, ax2, ax3 = axes
+
+        for start, end, s in segments:
+            ax1.axvspan(start, end, color=colors[s], alpha=0.18, zorder=0)
+        ax1.plot(p.index, p.values, color="#c9d1d9", lw=1.4, label=ticker, zorder=3)
+        ax1.set_yscale("log")
+        ax1.set_ylabel(f"{ticker} (log)")
+        ax1.set_title(
+            f"Chart 42 — {ticker} with Multivariate HMM Regimes  (K={K})"
+        )
+        _style(ax1)
+        patches = [mpatches.Patch(color=colors[i], alpha=0.5, label=lab)
+                   for i, lab in enumerate(labels)]
+        ax1.legend(handles=[*patches,
+                            plt.Line2D([0], [0], color="#c9d1d9", lw=1.4,
+                                       label=ticker)],
+                   fontsize=9, loc="upper left")
+
+        ax2.stackplot(posteriors.index, posteriors.values.T,
+                      colors=colors, labels=labels, alpha=0.85,
+                      edgecolor="none")
+        ax2.set_ylim(0, 1)
+        ax2.set_ylabel("P(regime | data)")
+        _style(ax2)
+        ax2.legend(loc="upper left", fontsize=8, ncol=K)
+
+        if vol_s is not None:
+            ax3.plot(vol_s.index, vol_s.values * np.sqrt(252) * 100,
+                     color=SENTINEL_PALETTE[1], lw=1.2,
+                     label=f"{vol_col[0]}  (ann. %)")
+            ax3.set_ylabel("Realised vol (ann. %)",
+                           color=SENTINEL_PALETTE[1])
+            ax3.tick_params(axis="y", colors=SENTINEL_PALETTE[1])
+        _style(ax3)
+
+        if apc_s is not None:
+            ax3b = ax3.twinx()
+            ax3b.plot(apc_s.index, apc_s.values,
+                      color=SENTINEL_PALETTE[4], lw=1.2,
+                      label=apc_col[0])
+            ax3b.set_ylabel("Avg pairwise corr",
+                            color=SENTINEL_PALETTE[4])
+            ax3b.tick_params(axis="y", colors=SENTINEL_PALETTE[4])
+            ax3b.spines[["top"]].set_visible(False)
+            h1, l1 = ax3.get_legend_handles_labels()
+            h2, l2 = ax3b.get_legend_handles_labels()
+            ax3.legend(h1 + h2, l1 + l2, fontsize=8, loc="upper left")
+        else:
+            ax3.legend(fontsize=8, loc="upper left")
+
+        ax3.set_xlabel("Date")
+
+        fig.tight_layout()
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        return fig
+
+
+# ── Chart 43 — Feature scatter pairs, coloured by state ──────────────────────
+
+def plot_feature_pairs_by_state(
+    features: pd.DataFrame,
+    viterbi_labeled: pd.Series,
+    labels: Sequence[str],
+    save_path: Optional[str] = None,
+) -> matplotlib.figure.Figure:
+    """
+    Chart 43 — Pairwise scatter plots of the features, points coloured by
+    Viterbi regime.
+
+    What you want to see: regimes occupy different blobs in feature space.
+    The HMM is essentially drawing ellipses in this multivariate cloud — if
+    the ellipses don't separate, the features aren't informative.
+    """
+    K = len(labels)
+    colors = _regime_colors(K)
+    feat_cols = list(features.columns)
+    if len(feat_cols) < 2:
+        raise ValueError("Need at least 2 features for scatter plots.")
+
+    pairs = []
+    for i in range(len(feat_cols)):
+        for j in range(i + 1, len(feat_cols)):
+            pairs.append((feat_cols[i], feat_cols[j]))
+    pairs = pairs[:3]
+
+    v = viterbi_labeled.reindex(features.index).dropna().astype(int)
+    feat = features.loc[v.index]
+
+    with plt.rc_context(CHART_STYLE):
+        fig, axes = plt.subplots(1, len(pairs), figsize=(5.5 * len(pairs), 5),
+                                 squeeze=False)
+        fig.suptitle("Chart 43 — Feature-Pair Scatter by HMM Regime",
+                     fontsize=13)
+
+        for col, (fx, fy) in enumerate(pairs):
+            ax = axes[0][col]
+            for i, lab in enumerate(labels):
+                mask = v == i
+                ax.scatter(feat.loc[mask, fx], feat.loc[mask, fy],
+                           s=10, alpha=0.55, color=colors[i],
+                           edgecolors="none", label=lab)
+            ax.set_xlabel(fx)
+            ax.set_ylabel(fy)
+            _style(ax)
+            if col == 0:
+                ax.legend(fontsize=9, markerscale=2)
+
+        fig.tight_layout()
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        return fig
+
+
+# ── Chart 44 — Per-feature per-state distribution boxplots ────────────────────
+
+def plot_feature_boxplots_by_state(
+    features: pd.DataFrame,
+    viterbi_labeled: pd.Series,
+    labels: Sequence[str],
+    save_path: Optional[str] = None,
+) -> matplotlib.figure.Figure:
+    """
+    Chart 44 — For each feature, a box plot comparing its distribution across
+    regimes.
+
+    Reads as: "When the HMM says we're in Bear, what does the distribution of
+    returns / vol / APC look like vs. Sideways vs. Bull?" This diagnoses
+    whether each feature is genuinely helping the classifier.
+    """
+    K = len(labels)
+    colors = _regime_colors(K)
+    feat_cols = list(features.columns)
+    D = len(feat_cols)
+
+    v = viterbi_labeled.reindex(features.index).dropna().astype(int)
+    feat = features.loc[v.index]
+
+    with plt.rc_context(CHART_STYLE):
+        fig, axes = plt.subplots(1, D, figsize=(5 * D, 5), squeeze=False)
+        fig.suptitle("Chart 44 — Feature Distributions by HMM Regime",
+                     fontsize=13)
+
+        for col, fc in enumerate(feat_cols):
+            ax = axes[0][col]
+            data = [feat.loc[v == i, fc].values for i in range(K)]
+            bp = ax.boxplot(
+                data, tick_labels=labels, patch_artist=True,
+                medianprops=dict(color="#c9d1d9", lw=1.5),
+                whiskerprops=dict(color="#8b949e"),
+                capprops=dict(color="#8b949e"),
+                flierprops=dict(marker="o", markersize=3,
+                                markerfacecolor="#8b949e",
+                                markeredgecolor="#8b949e", alpha=0.5),
+            )
+            for patch, c in zip(bp["boxes"], colors):
+                patch.set_facecolor(c)
+                patch.set_alpha(0.70)
+                patch.set_edgecolor("#0d1117")
+            ax.set_title(fc)
+            ax.set_ylabel(fc)
+            _style(ax)
+
+        fig.tight_layout()
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        return fig

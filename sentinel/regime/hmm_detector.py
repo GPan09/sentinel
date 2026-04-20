@@ -346,3 +346,303 @@ def regime_summary(
         "bic":             float(bic),
         "aic":             float(aic),
     }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Phase 4 Deliverable 2 — Multivariate HMM + Model Selection
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Why multivariate?
+# ─────────────────
+# A univariate HMM on returns alone conflates "high vol regime" with
+# "crashing regime" whenever mean drift is small — which is most of the time.
+# If the model sees daily return = −1% it can't tell whether that's a routine
+# wiggle inside a bull market or the first day of a bear. Extra information
+# helps:
+#
+#   • realized volatility (21-day σ)         — is the market noisy right now?
+#   • average pairwise correlation (APC)     — are assets moving together?
+#
+# These come from Phase 3. Together with returns they give the HMM a
+# 3-dimensional observation vector per day, and the Gaussian emission model
+# becomes a full trivariate Gaussian per regime. Covariance between features
+# within a state is explicitly modelled.
+#
+# Why BIC / AIC?
+# ──────────────
+# More states = more flexibility = higher likelihood, but also overfitting.
+# Information criteria penalize parameter count:
+#
+#   BIC = −2 · log L  +  k · log T       (Bayesian — stronger penalty, prefers simpler)
+#   AIC = −2 · log L  +  2 · k           (Akaike — weaker penalty, prefers richer)
+#
+# where k is the number of free parameters and T is the number of observations.
+# Smaller = better. BIC tends to be the conservative choice; we use it as the
+# tiebreaker and let AIC be a sanity check.
+
+def build_features(
+    prices: pd.DataFrame,
+    benchmark: str = "SPY",
+    vol_window: int = 21,
+    apc_window: int = 60,
+) -> pd.DataFrame:
+    """
+    Construct the multivariate observation matrix used by the D2 HMM.
+
+    Columns
+    -------
+    log_return    : daily log return of the benchmark ticker
+    vol_{W}d      : W-day rolling std of benchmark log returns
+    apc_{W}d      : W-day average pairwise correlation across all tickers
+
+    Returns a DataFrame indexed by date, aligned and NaN-free (rows with
+    insufficient history are dropped).
+    """
+    from sentinel.crash.correlation_spike import average_pairwise_correlation
+
+    if benchmark not in prices.columns:
+        raise ValueError(
+            f"benchmark {benchmark!r} not in prices columns {list(prices.columns)}"
+        )
+
+    log_rets = np.log(prices / prices.shift(1))
+    bench_r  = log_rets[benchmark].rename("log_return")
+    vol      = bench_r.rolling(vol_window).std().rename(f"vol_{vol_window}d")
+    apc      = average_pairwise_correlation(prices, apc_window).rename(
+        f"apc_{apc_window}d"
+    )
+
+    feat = pd.concat([bench_r, vol, apc], axis=1).dropna()
+    return feat
+
+
+def fit_hmm_mv(
+    features: pd.DataFrame,
+    n_states: int = 3,
+    covariance_type: str = "full",
+    n_iter: int = 500,
+    seed: int = 42,
+) -> dict:
+    """
+    Fit a multivariate Gaussian HMM.
+
+    Emission model
+    --------------
+    r_t | S_t = k   ~   Normal_D( μ_k , Σ_k )
+    where D = number of features. Σ_k is a D×D covariance matrix per state.
+
+    Labels
+    ------
+    States are re-indexed so that state 0 has the lowest *return* mean and
+    state K−1 has the highest — same convention as `fit_hmm`. This keeps
+    Bear/Sideways/Bull consistent across features / tickers / seeds.
+
+    Returns a dict with the same keys as `fit_hmm`, plus:
+        features        : input DataFrame (cleaned)
+        means_mv        : (K, D) array of per-state mean vectors
+        covariances_mv  : (K, D, D) array of per-state covariance matrices
+        feature_names   : list[str]
+    """
+    try:
+        from hmmlearn.hmm import GaussianHMM
+    except ImportError as e:
+        raise ImportError(
+            "hmmlearn not installed. `pip install hmmlearn`."
+        ) from e
+
+    f = features.dropna().astype(float)
+    X = f.values
+    T, D = X.shape
+
+    model = GaussianHMM(
+        n_components=n_states,
+        covariance_type=covariance_type,
+        n_iter=n_iter,
+        random_state=seed,
+        tol=1e-4,
+    )
+    model.fit(X)
+
+    post        = model.predict_proba(X)
+    viterbi_raw = model.predict(X)
+
+    # sort states by the RETURN dimension (column 0 is always log_return)
+    raw_means   = model.means_                   # shape (K, D)
+    return_means = raw_means[:, 0]
+    state_order = np.argsort(return_means).tolist()
+    index_map   = {raw: new for new, raw in enumerate(state_order)}
+
+    sorted_means = raw_means[state_order]                 # (K, D)
+    covars_full  = model.covars_                          # (K, D, D) for "full"
+    if covariance_type != "full":
+        # hmmlearn returns different shapes per covariance_type; normalize.
+        if covariance_type == "diag":
+            covars_full = np.array([np.diag(c) for c in model.covars_])
+        elif covariance_type == "spherical":
+            covars_full = np.array([np.eye(D) * c for c in model.covars_])
+        elif covariance_type == "tied":
+            covars_full = np.tile(model.covars_[None, :, :], (n_states, 1, 1))
+    sorted_covs  = covars_full[state_order]
+
+    viterbi_labeled = pd.Series(
+        [index_map[s] for s in viterbi_raw], index=f.index, name="state"
+    )
+    post_labeled = post[:, state_order]
+
+    trans_lab = model.transmat_[np.ix_(state_order, state_order)]
+    start_lab = model.startprob_[state_order]
+
+    labels = DEFAULT_LABELS.get(n_states,
+                                [f"S{i}" for i in range(n_states)])
+
+    posteriors_df = pd.DataFrame(post_labeled, index=f.index, columns=labels)
+    trans_df      = pd.DataFrame(trans_lab,    index=labels, columns=labels)
+
+    log_lik  = float(model.score(X))
+    # free params: K*D means + K * D(D+1)/2 cov entries + K(K-1) trans + (K-1) start
+    n_params = (
+        n_states * D
+        + n_states * D * (D + 1) // 2
+        + n_states * (n_states - 1)
+        + (n_states - 1)
+    )
+
+    return {
+        "model":            model,
+        "features":         f,
+        "feature_names":    list(f.columns),
+        "returns":          f.iloc[:, 0],   # for plotting convenience
+        "posteriors":       posteriors_df,
+        "viterbi":          pd.Series(viterbi_raw, index=f.index, name="state_raw"),
+        "viterbi_labeled":  viterbi_labeled,
+        "state_order":      state_order,
+        "means_mv":         sorted_means,      # (K, D)
+        "covariances_mv":   sorted_covs,       # (K, D, D)
+        "means":            sorted_means[:, 0],          # return mean per state (1D)
+        "variances":        np.array([c[0, 0] for c in sorted_covs]),  # return var
+        "trans_matrix":     trans_df,
+        "start_prob":       start_lab,
+        "log_likelihood":   log_lik,
+        "n_params":         n_params,
+        "n_obs":            T,
+        "labels":           labels,
+        "n_features":       D,
+        "covariance_type":  covariance_type,
+    }
+
+
+def compare_k(
+    features: pd.DataFrame,
+    k_values: Sequence[int] = (2, 3, 4, 5),
+    covariance_type: str = "full",
+    seed: int = 42,
+    n_iter: int = 500,
+) -> pd.DataFrame:
+    """
+    Fit the MV HMM at each K in `k_values` and return a comparison table.
+
+    Columns: n_states, log_likelihood, n_params, bic, aic, converged
+    Sorted by n_states ascending. Smaller BIC/AIC = better.
+    """
+    rows = []
+    for k in k_values:
+        try:
+            res = fit_hmm_mv(
+                features, n_states=k,
+                covariance_type=covariance_type,
+                seed=seed, n_iter=n_iter,
+            )
+            T  = res["n_obs"]
+            LL = res["log_likelihood"]
+            kp = res["n_params"]
+            rows.append({
+                "n_states":       k,
+                "log_likelihood": LL,
+                "n_params":       kp,
+                "bic":            -2 * LL + kp * np.log(T),
+                "aic":            -2 * LL + 2 * kp,
+                "converged":      bool(getattr(res["model"].monitor_,
+                                               "converged", True)),
+            })
+        except Exception as e:   # keep the table complete even on rare fit failures
+            rows.append({
+                "n_states":       k,
+                "log_likelihood": np.nan,
+                "n_params":       np.nan,
+                "bic":            np.nan,
+                "aic":            np.nan,
+                "converged":      False,
+                "error":          str(e),
+            })
+    return pd.DataFrame(rows).set_index("n_states")
+
+
+def choose_k(comparison: pd.DataFrame, criterion: str = "bic") -> int:
+    """Pick the K that minimises BIC (default) or AIC."""
+    col = comparison[criterion].dropna()
+    return int(col.idxmin())
+
+
+def regime_summary_mv(
+    features: pd.DataFrame,
+    n_states: int = 3,
+    seed: int = 42,
+    n_iter: int = 500,
+    covariance_type: str = "full",
+) -> dict:
+    """
+    Full multivariate HMM pipeline — analogue of `regime_summary` for MV data.
+
+    Returns every key from `fit_hmm_mv` plus:
+        characteristics  : per-state summary on the RETURN feature (annualised)
+        feature_stats    : per-state mean ± std for every feature (D columns × K rows)
+        segments         : regime-episode DataFrame (start/end/state/duration)
+        stationary       : long-run state probabilities
+        durations        : expected regime duration in days
+        current_state    : latest Viterbi label
+        current_post     : latest posterior row
+        bic, aic         : information criteria for the fitted K
+    """
+    result = fit_hmm_mv(
+        features, n_states=n_states, seed=seed,
+        n_iter=n_iter, covariance_type=covariance_type,
+    )
+    labels = result["labels"]
+
+    chars  = state_characteristics(result)
+    segs   = regime_segments(result["viterbi_labeled"], labels)
+    stat   = stationary_distribution(result["trans_matrix"])
+    dur    = expected_durations(result["trans_matrix"])
+
+    # per-feature per-state mean & std
+    feat_names = result["feature_names"]
+    rows = []
+    for i, lab in enumerate(labels):
+        row = {"state": lab}
+        for j, fn in enumerate(feat_names):
+            row[f"{fn}_mean"] = float(result["means_mv"][i, j])
+            row[f"{fn}_std"]  = float(np.sqrt(result["covariances_mv"][i, j, j]))
+        rows.append(row)
+    feature_stats = pd.DataFrame(rows).set_index("state")
+
+    T = result["n_obs"]
+    k = result["n_params"]
+    ll = result["log_likelihood"]
+    bic = -2 * ll + k * np.log(T)
+    aic = -2 * ll + 2 * k
+
+    current_state = labels[int(result["viterbi_labeled"].iloc[-1])]
+    current_post  = result["posteriors"].iloc[-1]
+
+    return {
+        **result,
+        "characteristics": chars,
+        "feature_stats":   feature_stats,
+        "segments":        segs,
+        "stationary":      stat,
+        "durations":       dur,
+        "current_state":   current_state,
+        "current_post":    current_post,
+        "bic":             float(bic),
+        "aic":             float(aic),
+    }
