@@ -140,7 +140,13 @@ def regime_gated_signal(
     elif gate_mode == "viterbi":
         if viterbi_labeled is None:
             raise ValueError("gate_mode='viterbi' requires viterbi_labeled=...")
-        sig = _signal_viterbi(viterbi_labeled, bullish_labels, posteriors.index)
+        # Pass posterior column order as the label list so that int-typed
+        # Viterbi series (which is what hmm_detector emits — 0..K-1 indices
+        # in mean-sorted order) can be translated to strings for set-matching.
+        sig = _signal_viterbi(
+            viterbi_labeled, bullish_labels, posteriors.index,
+            labels=list(posteriors.columns),
+        )
     elif gate_mode == "hysteresis":
         if not exit_threshold < enter_threshold:
             raise ValueError(
@@ -164,9 +170,27 @@ def _signal_posterior(posteriors, bullish_labels, threshold) -> pd.Series:
     return (bullish_prob > threshold).astype(int)
 
 
-def _signal_viterbi(viterbi_labeled, bullish_labels, target_index) -> pd.Series:
-    """State-based: invested iff Viterbi label is in bullish set."""
-    bullish_set = set(bullish_labels)
+def _signal_viterbi(viterbi_labeled, bullish_labels,
+                    target_index, labels=None) -> pd.Series:
+    """
+    State-based: invested iff Viterbi state is in bullish set.
+
+    Robust to two forms of `viterbi_labeled`:
+      • integer-indexed (0..K-1, as produced by hmm_detector) — requires
+        the `labels` list so we can translate bullish_labels to int indices
+      • string-labeled (e.g. 'Sideways') — matched directly
+
+    The int-indexed form is what sentinel.regime.hmm_detector emits.
+    """
+    if pd.api.types.is_numeric_dtype(viterbi_labeled):
+        if labels is None:
+            raise ValueError(
+                "_signal_viterbi: viterbi_labeled is integer-typed but "
+                "no `labels` list was provided for int→label mapping.")
+        bullish_set = {labels.index(lab) for lab in bullish_labels
+                       if lab in labels}
+    else:
+        bullish_set = set(bullish_labels)
     sig = viterbi_labeled.isin(bullish_set).astype(int)
     sig = sig.reindex(target_index).ffill().fillna(0).astype(int)
     return sig
