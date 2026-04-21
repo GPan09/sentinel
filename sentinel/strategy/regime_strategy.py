@@ -72,40 +72,148 @@ from sentinel.backtest.engine import Backtester
 
 
 # ── signal construction ───────────────────────────────────────────────────────
+#
+# Three signal modes are available. They differ in HOW the per-day posterior
+# distribution is collapsed into a 0/1 invested-vs-cash decision:
+#
+#   "posterior"  — naive: invested iff Σ_{k∈B} γ_t(k) > τ
+#                  Simple, but the soft posterior wiggles around τ on noise,
+#                  producing many spurious in/out flips even within a single
+#                  underlying regime.
+#
+#   "viterbi"    — state-based: invested iff the Viterbi-decoded state at t is
+#                  in B. Viterbi applies HMM smoothing across the entire
+#                  sequence so it produces clean, contiguous regime episodes
+#                  with no chatter — the cost is some lag at regime turns.
+#
+#   "hysteresis" — engineering-grade: enter when P_bullish > τ_enter, exit when
+#                  P_bullish < τ_exit (with τ_enter > τ_exit), AND once a
+#                  position is taken, hold it for at least `min_hold_days`
+#                  before allowing another flip. Eliminates single-day noise
+#                  flips and forces the model to be confident BOTH ways.
 
 def regime_gated_signal(
     posteriors: pd.DataFrame,
     bullish_labels: Sequence[str],
     threshold: float = 0.5,
+    *,
+    gate_mode: str = "posterior",
+    viterbi_labeled: pd.Series | None = None,
+    enter_threshold: float = 0.6,
+    exit_threshold: float = 0.35,
+    min_hold_days: int = 5,
 ) -> pd.Series:
     """
-    Map per-day posterior probabilities to a 0/1 "invested vs cash" signal.
+    Map per-day regime evidence to a 0/1 "invested vs cash" signal.
 
     Parameters
     ----------
-    posteriors : pd.DataFrame   shape (T, K), columns = state labels
-    bullish_labels : list[str]  regimes we want to be invested during
-    threshold : float           posterior-mass cutoff (default 0.5)
+    posteriors : pd.DataFrame
+        Shape (T, K), columns = state labels.
+    bullish_labels : list[str]
+        Regimes we want to be invested during.
+    threshold : float
+        Posterior-mass cutoff for `gate_mode='posterior'` (default 0.5).
+    gate_mode : {'posterior', 'viterbi', 'hysteresis'}
+        Signal-construction mode (see module docstring above).
+    viterbi_labeled : pd.Series | None
+        Required when `gate_mode='viterbi'`. Per-day decoded state labels.
+    enter_threshold, exit_threshold : float
+        Asymmetric thresholds for `gate_mode='hysteresis'`. Must satisfy
+        `exit_threshold < enter_threshold` to provide hysteresis. Defaults
+        0.6 / 0.35.
+    min_hold_days : int
+        Minimum holding period (days) once a position flip occurs. Used by
+        the hysteresis mode (default 5).
 
     Returns
     -------
     pd.Series of int {0, 1}, same DatetimeIndex as `posteriors`.
-
-    Notes
-    -----
-    The threshold is applied to the SUM of posterior probabilities across the
-    bullish set. With K=3 and bullish_labels = ["Sideways", "Bull"], we hold
-    whenever P(Sideways) + P(Bull) > 0.5 — i.e. when the model is more likely
-    NOT in Bear than in Bear.
     """
     missing = [lab for lab in bullish_labels if lab not in posteriors.columns]
     if missing:
         raise ValueError(f"bullish_labels not found in posteriors: {missing}. "
                          f"Available: {list(posteriors.columns)}")
+
+    if gate_mode == "posterior":
+        sig = _signal_posterior(posteriors, bullish_labels, threshold)
+    elif gate_mode == "viterbi":
+        if viterbi_labeled is None:
+            raise ValueError("gate_mode='viterbi' requires viterbi_labeled=...")
+        sig = _signal_viterbi(viterbi_labeled, bullish_labels, posteriors.index)
+    elif gate_mode == "hysteresis":
+        if not exit_threshold < enter_threshold:
+            raise ValueError(
+                f"hysteresis requires exit_threshold ({exit_threshold}) "
+                f"< enter_threshold ({enter_threshold})")
+        sig = _signal_hysteresis(
+            posteriors, bullish_labels,
+            enter_threshold, exit_threshold, min_hold_days,
+        )
+    else:
+        raise ValueError(
+            f"gate_mode={gate_mode!r} not recognised. "
+            f"Use one of: 'posterior', 'viterbi', 'hysteresis'.")
+    sig.name = "signal"
+    return sig
+
+
+def _signal_posterior(posteriors, bullish_labels, threshold) -> pd.Series:
+    """Naive: invested iff sum of bullish posteriors exceeds threshold."""
     bullish_prob = posteriors[list(bullish_labels)].sum(axis=1)
-    signal = (bullish_prob > threshold).astype(int)
-    signal.name = "signal"
-    return signal
+    return (bullish_prob > threshold).astype(int)
+
+
+def _signal_viterbi(viterbi_labeled, bullish_labels, target_index) -> pd.Series:
+    """State-based: invested iff Viterbi label is in bullish set."""
+    bullish_set = set(bullish_labels)
+    sig = viterbi_labeled.isin(bullish_set).astype(int)
+    sig = sig.reindex(target_index).ffill().fillna(0).astype(int)
+    return sig
+
+
+def _signal_hysteresis(posteriors, bullish_labels,
+                       enter_threshold, exit_threshold, min_hold_days) -> pd.Series:
+    """
+    Asymmetric thresholds + minimum hold period.
+
+    State machine
+    -------------
+        position = 0 (cash)
+        if P_bullish_t > enter_threshold AND held position ≥ min_hold_days:
+            position ← 1
+        elif P_bullish_t < exit_threshold AND held position ≥ min_hold_days:
+            position ← 0
+        else:
+            position unchanged
+    """
+    bullish_prob = posteriors[list(bullish_labels)].sum(axis=1).to_numpy()
+    T = len(bullish_prob)
+    sig = np.zeros(T, dtype=int)
+
+    # Cold start — invested iff first day clears enter_threshold
+    pos = 1 if bullish_prob[0] > enter_threshold else 0
+    sig[0] = pos
+    days_in_pos = 1
+
+    for t in range(1, T):
+        if days_in_pos < min_hold_days:
+            # Locked in by min-hold rule
+            sig[t] = pos
+            days_in_pos += 1
+            continue
+
+        if pos == 0 and bullish_prob[t] > enter_threshold:
+            pos = 1
+            days_in_pos = 1
+        elif pos == 1 and bullish_prob[t] < exit_threshold:
+            pos = 0
+            days_in_pos = 1
+        else:
+            days_in_pos += 1
+        sig[t] = pos
+
+    return pd.Series(sig, index=posteriors.index, dtype=int)
 
 
 def classify_labels(labels: Sequence[str]) -> Dict[str, list]:
@@ -133,10 +241,19 @@ def run_strategy(
     bullish_labels: Sequence[str],
     threshold: float = 0.5,
     initial: float = 10_000.0,
+    *,
+    gate_mode: str = "posterior",
+    viterbi_labeled: pd.Series | None = None,
+    enter_threshold: float = 0.6,
+    exit_threshold: float = 0.35,
+    min_hold_days: int = 5,
 ) -> dict:
     """
     Run the regime-gated strategy and return a dict of everything downstream
     code (plots, CSV writers, nowcast) will need.
+
+    `gate_mode` selects how the per-day regime evidence is collapsed into a
+    0/1 signal — see `regime_gated_signal` for the three available modes.
 
     Returns
     -------
@@ -148,11 +265,20 @@ def run_strategy(
       'bullish_prob':    pd.Series P(bullish regimes) per day,
       'labels_used':     {'bullish': [...], 'bearish': [...]},
       'threshold':       float,
+      'gate_mode':       str,
+      'gate_params':     dict echo of the mode-specific params in effect,
     }
     """
     # Align — posteriors may start later than prices (features need warmup).
     prices_aligned = prices.reindex(posteriors.index).dropna()
-    signal = regime_gated_signal(posteriors, bullish_labels, threshold)
+    signal = regime_gated_signal(
+        posteriors, bullish_labels, threshold,
+        gate_mode=gate_mode,
+        viterbi_labeled=viterbi_labeled,
+        enter_threshold=enter_threshold,
+        exit_threshold=exit_threshold,
+        min_hold_days=min_hold_days,
+    )
     signal = signal.reindex(prices_aligned.index).ffill().fillna(0).astype(int)
 
     bt = Backtester(prices_aligned, signal, initial=initial).run()
@@ -163,6 +289,17 @@ def run_strategy(
     bullish_prob = posteriors[list(bullish_labels)].sum(axis=1)
     bullish_prob = bullish_prob.reindex(prices_aligned.index).ffill()
 
+    # Echo back only the params that are actually in force for this mode
+    gate_params = {"gate_mode": gate_mode}
+    if gate_mode == "posterior":
+        gate_params["threshold"] = threshold
+    elif gate_mode == "hysteresis":
+        gate_params.update({
+            "enter_threshold": enter_threshold,
+            "exit_threshold":  exit_threshold,
+            "min_hold_days":   min_hold_days,
+        })
+
     return {
         "signal":        signal,
         "backtester":    bt,
@@ -171,6 +308,8 @@ def run_strategy(
         "bullish_prob":  bullish_prob,
         "labels_used":   {"bullish": list(bullish_labels)},
         "threshold":     threshold,
+        "gate_mode":     gate_mode,
+        "gate_params":   gate_params,
     }
 
 

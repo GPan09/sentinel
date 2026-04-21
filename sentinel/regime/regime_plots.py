@@ -1003,3 +1003,127 @@ def plot_nowcast_dashboard(
             fig.savefig(save_path, dpi=150, bbox_inches="tight",
                         facecolor=fig.get_facecolor())
         return fig
+
+
+# ── Chart 49 — Gate-mode comparison (D3.1) ───────────────────────────────────
+
+def plot_gate_mode_comparison(
+    runs: dict,
+    equity_bh: pd.Series,
+    rolling_alphas: dict,
+    ticker: str = "SPY",
+    save_path: Optional[str] = None,
+):
+    """
+    Chart 49 — How the same regime model performs under different signal modes.
+
+    Three modes are overlaid against buy-and-hold:
+        • posterior   — naive Σ γ_bullish > τ
+        • viterbi     — invested iff Viterbi state ∈ bullish set
+        • hysteresis  — asymmetric thresholds + min-hold period
+
+    Top panel:    equity curves on log scale (all modes + B&H)
+    Middle panel: rolling 252-day alpha for each mode (line plot)
+    Bottom panel: text table of CAGR / Sharpe / MDD / # trades
+
+    Parameters
+    ----------
+    runs : dict[str, dict]
+        mode_name -> the dict returned by run_strategy. Required keys per run:
+        'backtester' (with .equity_strat), 'metrics_strat'.
+    equity_bh : pd.Series
+        Buy-and-hold equity curve (same for all modes).
+    rolling_alphas : dict[str, pd.Series]
+        mode_name -> rolling 252-day alpha series.
+    """
+    mode_colors = {
+        "posterior":  "#d62728",   # red
+        "viterbi":    "#2ca02c",   # green
+        "hysteresis": "#1f77b4",   # blue
+    }
+
+    with plt.rc_context(CHART_STYLE):
+        fig, (ax1, ax2, ax3) = plt.subplots(
+            3, 1, figsize=(13, 10), sharex=False,
+            gridspec_kw={"height_ratios": [3, 2, 1.4]},
+        )
+
+        # ── Top: equity curves ────────────────────────────────────────────────
+        ax1.plot(equity_bh.index, equity_bh.values,
+                 color="#8b949e", lw=1.4, label=f"{ticker} buy-and-hold")
+        for mode, run in runs.items():
+            eq = run["backtester"].equity_strat
+            color = mode_colors.get(mode, "#9467bd")
+            ax1.plot(eq.index, eq.values, color=color, lw=1.6,
+                     label=f"{mode} mode")
+        ax1.set_yscale("log")
+        ax1.set_ylabel("Equity ($, log)")
+        ax1.set_title(f"Chart 49 — Gate-Mode Comparison  ({ticker})")
+        ax1.legend(loc="upper left", framealpha=0.85)
+        _style(ax1)
+
+        # ── Middle: rolling alpha ─────────────────────────────────────────────
+        ax2.axhline(0, color="#8b949e", lw=0.8, alpha=0.6)
+        for mode, ralpha in rolling_alphas.items():
+            valid = ralpha.dropna()
+            if len(valid) == 0:
+                continue
+            color = mode_colors.get(mode, "#9467bd")
+            ax2.plot(valid.index, valid.values * 100, color=color, lw=1.4,
+                     label=f"{mode}")
+        ax2.set_ylabel("Rolling 252d α  (%)")
+        ax2.set_title("Rolling 1-year alpha vs Buy-and-Hold")
+        ax2.legend(loc="upper left", framealpha=0.85)
+        _style(ax2)
+
+        # ── Bottom: metrics table ─────────────────────────────────────────────
+        ax3.axis("off")
+        rows = [["Mode", "CAGR", "Sharpe", "Max DD", "Trades", "% Invested"]]
+        # Add B&H first
+        bh_metrics = next(iter(runs.values()))["metrics_bh"]
+        rows.append([
+            "buy-and-hold",
+            f"{bh_metrics.get('cagr', 0)*100:+.2f}%",
+            f"{bh_metrics.get('sharpe', 0):+.2f}",
+            f"{bh_metrics.get('max_drawdown', 0)*100:+.2f}%",
+            "—", "100.0%",
+        ])
+        for mode, run in runs.items():
+            m = run["metrics_strat"]
+            sig = run["signal"]
+            n_trades = int(sig.diff().abs().fillna(0).sum())
+            rows.append([
+                mode,
+                f"{m.get('cagr', 0)*100:+.2f}%",
+                f"{m.get('sharpe', 0):+.2f}",
+                f"{m.get('max_drawdown', 0)*100:+.2f}%",
+                f"{n_trades}",
+                f"{sig.mean()*100:.1f}%",
+            ])
+        table = ax3.table(
+            cellText=rows[1:], colLabels=rows[0],
+            cellLoc="center", colLoc="center", loc="center",
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(10)
+        table.scale(1.0, 1.45)
+        for (r, c), cell in table.get_celld().items():
+            cell.set_edgecolor("#30363d")
+            cell.set_facecolor("#161b22")
+            cell.get_text().set_color("#c9d1d9")
+            if r == 0:
+                cell.set_text_props(weight="bold", color="#f0f6fc")
+                cell.set_facecolor("#21262d")
+            elif c == 0 and r >= 2:
+                # Color-code the mode-name cell
+                mode_name = rows[r][0]
+                color = mode_colors.get(mode_name)
+                if color:
+                    cell.set_facecolor(color)
+                    cell.set_alpha(0.35)
+
+        fig.tight_layout()
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches="tight",
+                        facecolor=fig.get_facecolor())
+        return fig

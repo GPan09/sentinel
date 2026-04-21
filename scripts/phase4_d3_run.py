@@ -25,6 +25,16 @@ Usage
     python3 scripts/phase4_d3_run.py --benchmark SPY --period 5y
     python3 scripts/phase4_d3_run.py --threshold 0.6
     python3 scripts/phase4_d3_run.py --k_states 5       # use 5-state model
+
+D3.1 — gate-mode comparison
+---------------------------
+    # Run all three gate modes side-by-side and emit chart 49 + sweep CSV
+    python3 scripts/phase4_d3_run.py --sweep_modes
+
+    # Or pick a single non-default gate mode for charts 45-48
+    python3 scripts/phase4_d3_run.py --gate_mode viterbi
+    python3 scripts/phase4_d3_run.py --gate_mode hysteresis \
+            --enter_threshold 0.65 --exit_threshold 0.35 --min_hold_days 7
 """
 
 import argparse, os, pathlib, subprocess, sys
@@ -46,6 +56,7 @@ from sentinel.regime.regime_plots import (
     plot_rolling_alpha,
     plot_regime_transitions_nowcast,
     plot_nowcast_dashboard,
+    plot_gate_mode_comparison,
 )
 from sentinel.strategy.regime_strategy import (
     run_strategy,
@@ -81,6 +92,19 @@ def parse_args():
     p.add_argument("--seed",    type=int, default=42)
     p.add_argument("--n_iter",  type=int, default=500)
     p.add_argument("--outdir",  default="outputs/phase4")
+    # ── D3.1 gate-mode args ──
+    p.add_argument("--gate_mode",
+                   choices=["posterior", "viterbi", "hysteresis"],
+                   default="posterior",
+                   help="Signal-construction mode for the primary strategy.")
+    p.add_argument("--enter_threshold", type=float, default=0.6,
+                   help="Hysteresis: enter when P_bullish > this.")
+    p.add_argument("--exit_threshold",  type=float, default=0.35,
+                   help="Hysteresis: exit when P_bullish < this.")
+    p.add_argument("--min_hold_days",   type=int,   default=5,
+                   help="Hysteresis: minimum holding period after a flip.")
+    p.add_argument("--sweep_modes", action="store_true",
+                   help="Run ALL three gate modes and emit chart 49 comparison.")
     return p.parse_args()
 
 
@@ -122,8 +146,16 @@ def main():
     bullish = groups["bullish"]
     bearish = groups["bearish"]
     print(f"\nRegime gate: bullish={bullish}  bearish={bearish}")
-    print(f"Policy: hold {args.benchmark} when "
-          f"P({' ∪ '.join(bullish)}) > {args.threshold:.2f}")
+    if args.gate_mode == "posterior":
+        print(f"Policy [posterior]: hold {args.benchmark} when "
+              f"P({' ∪ '.join(bullish)}) > {args.threshold:.2f}")
+    elif args.gate_mode == "viterbi":
+        print(f"Policy [viterbi]: hold {args.benchmark} when "
+              f"Viterbi state ∈ {bullish}")
+    else:
+        print(f"Policy [hysteresis]: enter when P_bullish > "
+              f"{args.enter_threshold:.2f}, exit when < "
+              f"{args.exit_threshold:.2f}, min hold {args.min_hold_days}d")
 
     strat = run_strategy(
         prices=raw[args.benchmark],
@@ -131,6 +163,11 @@ def main():
         bullish_labels=bullish,
         threshold=args.threshold,
         initial=args.initial,
+        gate_mode=args.gate_mode,
+        viterbi_labeled=summary["viterbi_labeled"],
+        enter_threshold=args.enter_threshold,
+        exit_threshold=args.exit_threshold,
+        min_hold_days=args.min_hold_days,
     )
 
     m_s = strat["metrics_strat"]
@@ -180,6 +217,50 @@ def main():
     print(f"    position today        : "
           f"{'INVESTED' if nc['invested'] else 'CASH'}")
 
+    # ── 7b. gate-mode sweep (D3.1) ────────────────────────────────────────────
+    sweep_runs = None
+    if args.sweep_modes:
+        print("\nSweeping all three gate modes …")
+        sweep_configs = [
+            ("posterior",  dict(gate_mode="posterior",  threshold=args.threshold)),
+            ("viterbi",    dict(gate_mode="viterbi")),
+            ("hysteresis", dict(gate_mode="hysteresis",
+                                enter_threshold=args.enter_threshold,
+                                exit_threshold=args.exit_threshold,
+                                min_hold_days=args.min_hold_days)),
+        ]
+        sweep_runs = {}
+        sweep_alphas = {}
+        for mode, cfg in sweep_configs:
+            run = run_strategy(
+                prices=raw[args.benchmark],
+                posteriors=summary["posteriors"],
+                bullish_labels=bullish,
+                viterbi_labeled=summary["viterbi_labeled"],
+                initial=args.initial,
+                **cfg,
+            )
+            sweep_runs[mode]   = run
+            bt_m               = run["backtester"]
+            sweep_alphas[mode] = rolling_alpha(bt_m.returns_strat,
+                                               bt_m.returns_bh,
+                                               window=args.alpha_window)
+
+        # Side-by-side comparison print
+        print(f"\n  {'Mode':<12}{'Trades':>8}{'%Inv':>8}{'CAGR':>10}"
+              f"{'Sharpe':>9}{'MaxDD':>10}")
+        bh_m = sweep_runs["posterior"]["metrics_bh"]
+        print(f"  {'buy-hold':<12}{'—':>8}{'100.0%':>8}"
+              f"{bh_m['cagr']*100:>+9.2f}%{bh_m['sharpe']:>+9.2f}"
+              f"{bh_m['max_drawdown']*100:>+9.2f}%")
+        for mode, run in sweep_runs.items():
+            m   = run["metrics_strat"]
+            sig = run["signal"]
+            n_t = int(sig.diff().abs().fillna(0).sum())
+            print(f"  {mode:<12}{n_t:>8}{sig.mean()*100:>7.1f}%"
+                  f"{m['cagr']*100:>+9.2f}%{m['sharpe']:>+9.2f}"
+                  f"{m['max_drawdown']*100:>+9.2f}%")
+
     # ── 8. charts ──────────────────────────────────────────────────────────────
     print("\nPlotting chart 45: regime-gated equity curve …")
     fig45 = plot_regime_gated_equity(
@@ -227,6 +308,17 @@ def main():
     )
     plt.close(fig48)
 
+    if sweep_runs:
+        print("Plotting chart 49: gate-mode comparison …")
+        fig49 = plot_gate_mode_comparison(
+            runs            = sweep_runs,
+            equity_bh       = bt.equity_bh,
+            rolling_alphas  = sweep_alphas,
+            ticker          = args.benchmark,
+            save_path       = str(out_dir / "49_gate_mode_comparison.png"),
+        )
+        plt.close(fig49)
+
     # ── 9. CSVs ───────────────────────────────────────────────────────────────
     pd.DataFrame({
         "equity_strat": bt.equity_strat,
@@ -245,6 +337,28 @@ def main():
         "buy_hold": pd.Series(m_b),
     }).to_csv(out_dir / "strategy_metrics.csv")
 
+    # D3.1 — gate-mode sweep CSV
+    if sweep_runs:
+        sweep_rows = {}
+        for mode, run in sweep_runs.items():
+            m = run["metrics_strat"]
+            sig = run["signal"]
+            sweep_rows[mode] = {
+                "cagr":          m.get("cagr"),
+                "sharpe":        m.get("sharpe"),
+                "max_drawdown":  m.get("max_drawdown"),
+                "n_trades":      int(sig.diff().abs().fillna(0).sum()),
+                "pct_invested":  float(sig.mean()),
+            }
+        sweep_rows["buy_hold"] = {
+            "cagr":         sweep_runs["posterior"]["metrics_bh"].get("cagr"),
+            "sharpe":       sweep_runs["posterior"]["metrics_bh"].get("sharpe"),
+            "max_drawdown": sweep_runs["posterior"]["metrics_bh"].get("max_drawdown"),
+            "n_trades":     None,
+            "pct_invested": 1.0,
+        }
+        pd.DataFrame(sweep_rows).T.to_csv(out_dir / "gate_mode_sweep.csv")
+
     # ── 10. done ──────────────────────────────────────────────────────────────
     new_files = [
         "45_regime_gated_equity.png", "46_rolling_alpha.png",
@@ -253,6 +367,8 @@ def main():
         "regime_change_score.csv", "transition_days.csv",
         "nowcast.csv", "strategy_metrics.csv",
     ]
+    if sweep_runs:
+        new_files += ["49_gate_mode_comparison.png", "gate_mode_sweep.csv"]
     print(f"\n✅  Done! New files in {out_dir}:")
     for f in new_files:
         if (out_dir / f).exists():
@@ -261,14 +377,18 @@ def main():
     # ── 11. git commit + push ─────────────────────────────────────────────────
     print("\nCommitting Phase 4 D3 files to GitHub …")
     os.chdir(REPO_ROOT)
+    commit_msg = (
+        "Phase4 D3.1: add viterbi + hysteresis gate modes + chart 49"
+        if args.sweep_modes
+        else "Phase4 D3 rerun ({} mode)".format(args.gate_mode)
+    )
     cmds = [
         ["git", "add",
          "sentinel/strategy/__init__.py",
          "sentinel/strategy/regime_strategy.py",
          "sentinel/regime/regime_plots.py",
          "scripts/phase4_d3_run.py"],
-        ["git", "commit", "-m",
-         "Add Phase4 D3: regime-gated strategy + nowcast dashboard (charts 45-48)"],
+        ["git", "commit", "-m", commit_msg],
         ["git", "push"],
     ]
     for cmd in cmds:
